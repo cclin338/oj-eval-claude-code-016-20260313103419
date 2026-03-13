@@ -1,0 +1,21 @@
+20
+insert a 1
+insert a 2
+insert a 3
+find a
+delete a 2
+find a
+insert b 100
+insert b 50
+insert b 75
+find b
+delete b 100
+delete b 50
+find b
+insert c 1
+insert c 2
+delete c 1
+delete c 2
+find c
+insert d 999
+find d

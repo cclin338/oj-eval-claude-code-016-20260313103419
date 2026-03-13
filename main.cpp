@@ -6,51 +6,53 @@
 
 using namespace std;
 
-const int BLOCK_SIZE = 4096;
 const int MAX_KEY_SIZE = 64;
-const int M = 100; // B+ tree order
+const int ORDER = 85; // B+ tree order - optimized for block size
 
-struct Key {
+struct Entry {
     char index[MAX_KEY_SIZE + 1];
     int value;
 
-    Key() {
+    Entry() {
         memset(index, 0, sizeof(index));
         value = 0;
     }
 
-    Key(const char* idx, int val) {
+    Entry(const char* idx, int val) {
         memset(index, 0, sizeof(index));
         strncpy(index, idx, MAX_KEY_SIZE);
+        index[MAX_KEY_SIZE] = '\0';
         value = val;
     }
 
-    bool operator<(const Key& other) const {
+    bool operator<(const Entry& other) const {
         int cmp = strcmp(index, other.index);
         if (cmp != 0) return cmp < 0;
         return value < other.value;
     }
 
-    bool operator==(const Key& other) const {
+    bool operator==(const Entry& other) const {
         return strcmp(index, other.index) == 0 && value == other.value;
     }
 
-    bool operator<=(const Key& other) const {
-        return *this < other || *this == other;
+    bool keyEquals(const char* idx) const {
+        return strcmp(index, idx) == 0;
     }
 };
 
 struct Node {
     bool is_leaf;
-    int key_count;
-    Key keys[M];
-    int children[M + 1]; // file positions for internal nodes, or -1
-    int next; // for leaf nodes, pointer to next leaf
+    int n; // number of keys
+    Entry keys[ORDER];
+    int children[ORDER + 1]; // positions in file
+    int next; // for leaf nodes
 
     Node() {
         is_leaf = true;
-        key_count = 0;
-        memset(children, -1, sizeof(children));
+        n = 0;
+        for (int i = 0; i <= ORDER; i++) {
+            children[i] = -1;
+        }
         next = -1;
     }
 };
@@ -79,122 +81,156 @@ private:
         return node;
     }
 
-    void split_child(Node& parent, int index, Node& child) {
-        Node new_child;
-        new_child.is_leaf = child.is_leaf;
-
-        int mid = (M + 1) / 2;
-        new_child.key_count = child.key_count - mid;
-
-        for (int i = 0; i < new_child.key_count; i++) {
-            new_child.keys[i] = child.keys[mid + i];
-        }
-
-        if (!child.is_leaf) {
-            for (int i = 0; i <= new_child.key_count; i++) {
-                new_child.children[i] = child.children[mid + i];
-            }
-        }
-
-        child.key_count = mid;
-
-        if (child.is_leaf) {
-            new_child.next = child.next;
-            int new_pos = allocate_node();
-            child.next = new_pos;
-            write_node(new_pos, new_child);
-
-            for (int i = parent.key_count; i > index + 1; i--) {
-                parent.children[i + 1] = parent.children[i];
-            }
-            for (int i = parent.key_count - 1; i >= index; i--) {
-                parent.keys[i + 1] = parent.keys[i];
-            }
-
-            parent.keys[index] = new_child.keys[0];
-            parent.children[index + 1] = new_pos;
-            parent.key_count++;
-        } else {
-            int new_pos = allocate_node();
-            write_node(new_pos, new_child);
-
-            for (int i = parent.key_count; i > index + 1; i--) {
-                parent.children[i + 1] = parent.children[i];
-            }
-            for (int i = parent.key_count - 1; i >= index; i--) {
-                parent.keys[i + 1] = parent.keys[i];
-            }
-
-            parent.keys[index] = child.keys[mid - 1];
-            parent.children[index + 1] = new_pos;
-            parent.key_count++;
-
-            child.key_count--;
-        }
-    }
-
-    void insert_non_full(int node_pos, const Key& key) {
-        Node node = read_node(node_pos);
-
-        if (node.is_leaf) {
-            int i = node.key_count - 1;
-            while (i >= 0 && key < node.keys[i]) {
-                node.keys[i + 1] = node.keys[i];
-                i--;
-            }
-            node.keys[i + 1] = key;
-            node.key_count++;
-            write_node(node_pos, node);
-        } else {
-            int i = node.key_count - 1;
-            while (i >= 0 && key < node.keys[i]) {
-                i--;
-            }
+    int find_child_index(const Node& node, const Entry& entry) {
+        int i = 0;
+        while (i < node.n && entry.index[0] != '\0' && node.keys[i] < entry) {
             i++;
+        }
+        return i;
+    }
 
-            Node child = read_node(node.children[i]);
-            if (child.key_count == M) {
-                split_child(node, i, child);
-                write_node(node.children[i], child);
-                write_node(node_pos, node);
+    void insert_in_leaf(Node& leaf, const Entry& entry) {
+        int i = leaf.n - 1;
+        while (i >= 0 && entry < leaf.keys[i]) {
+            leaf.keys[i + 1] = leaf.keys[i];
+            i--;
+        }
+        leaf.keys[i + 1] = entry;
+        leaf.n++;
+    }
 
-                if (node.keys[i] < key || node.keys[i] == key) {
-                    i++;
-                }
+    void insert_in_parent(int left_pos, const Entry& key, int right_pos, vector<int>& path) {
+        if (path.empty()) {
+            // Create new root
+            Node new_root;
+            new_root.is_leaf = false;
+            new_root.n = 1;
+            new_root.keys[0] = key;
+            new_root.children[0] = left_pos;
+            new_root.children[1] = right_pos;
+
+            int new_root_pos = allocate_node();
+            root_pos = new_root_pos;
+            write_node(new_root_pos, new_root);
+            return;
+        }
+
+        int parent_pos = path.back();
+        path.pop_back();
+        Node parent = read_node(parent_pos);
+
+        if (parent.n < ORDER) {
+            // Insert in parent
+            int i = parent.n - 1;
+            while (i >= 0 && key < parent.keys[i]) {
+                parent.keys[i + 1] = parent.keys[i];
+                parent.children[i + 2] = parent.children[i + 1];
+                i--;
             }
-            insert_non_full(node.children[i], key);
+            parent.keys[i + 1] = key;
+            parent.children[i + 2] = right_pos;
+            parent.n++;
+            write_node(parent_pos, parent);
+        } else {
+            // Split parent
+            Node new_parent;
+            new_parent.is_leaf = false;
+
+            int mid = ORDER / 2;
+            Entry entries[ORDER + 1];
+            int child_ptrs[ORDER + 2];
+
+            // Copy existing entries
+            for (int i = 0; i < parent.n; i++) {
+                entries[i] = parent.keys[i];
+                child_ptrs[i] = parent.children[i];
+            }
+            child_ptrs[parent.n] = parent.children[parent.n];
+
+            // Insert new entry
+            int i = parent.n;
+            while (i > 0 && key < entries[i - 1]) {
+                entries[i] = entries[i - 1];
+                child_ptrs[i + 1] = child_ptrs[i];
+                i--;
+            }
+            entries[i] = key;
+            child_ptrs[i + 1] = right_pos;
+
+            // Split
+            parent.n = mid;
+            for (int i = 0; i < mid; i++) {
+                parent.keys[i] = entries[i];
+                parent.children[i] = child_ptrs[i];
+            }
+            parent.children[mid] = child_ptrs[mid];
+
+            Entry split_key = entries[mid];
+
+            new_parent.n = ORDER - mid;
+            for (int i = 0; i < new_parent.n; i++) {
+                new_parent.keys[i] = entries[mid + 1 + i];
+                new_parent.children[i] = child_ptrs[mid + 1 + i];
+            }
+            new_parent.children[new_parent.n] = child_ptrs[ORDER + 1];
+
+            int new_parent_pos = allocate_node();
+            write_node(parent_pos, parent);
+            write_node(new_parent_pos, new_parent);
+
+            insert_in_parent(parent_pos, split_key, new_parent_pos, path);
         }
     }
 
-    void remove_from_leaf(Node& node, int index) {
-        for (int i = index; i < node.key_count - 1; i++) {
-            node.keys[i] = node.keys[i + 1];
-        }
-        node.key_count--;
-    }
-
-    bool delete_key(int node_pos, const Key& key) {
+    void insert_helper(int node_pos, const Entry& entry, vector<int>& path) {
         Node node = read_node(node_pos);
 
         if (node.is_leaf) {
-            for (int i = 0; i < node.key_count; i++) {
-                if (node.keys[i] == key) {
-                    remove_from_leaf(node, i);
-                    write_node(node_pos, node);
-                    return true;
-                }
-            }
-            return false;
-        } else {
-            int i = 0;
-            while (i < node.key_count && node.keys[i] < key) {
-                i++;
-            }
+            if (node.n < ORDER) {
+                insert_in_leaf(node, entry);
+                write_node(node_pos, node);
+            } else {
+                // Split leaf
+                Node new_leaf;
+                new_leaf.is_leaf = true;
+                new_leaf.next = node.next;
 
-            if (node.children[i] != -1) {
-                return delete_key(node.children[i], key);
+                Entry entries[ORDER + 1];
+                for (int i = 0; i < node.n; i++) {
+                    entries[i] = node.keys[i];
+                }
+
+                // Insert new entry
+                int i = node.n;
+                while (i > 0 && entry < entries[i - 1]) {
+                    entries[i] = entries[i - 1];
+                    i--;
+                }
+                entries[i] = entry;
+
+                // Split
+                int mid = (ORDER + 1) / 2;
+                node.n = mid;
+                for (int i = 0; i < mid; i++) {
+                    node.keys[i] = entries[i];
+                }
+
+                new_leaf.n = ORDER + 1 - mid;
+                for (int i = 0; i < new_leaf.n; i++) {
+                    new_leaf.keys[i] = entries[mid + i];
+                }
+
+                int new_leaf_pos = allocate_node();
+                node.next = new_leaf_pos;
+                write_node(node_pos, node);
+                write_node(new_leaf_pos, new_leaf);
+
+                insert_in_parent(node_pos, new_leaf.keys[0], new_leaf_pos, path);
             }
-            return false;
+        } else {
+            int idx = find_child_index(node, entry);
+            path.push_back(node_pos);
+            insert_helper(node.children[idx], entry, path);
         }
     }
 
@@ -202,8 +238,8 @@ public:
     BPlusTree(const string& fname) : filename(fname) {
         file.open(filename, ios::in | ios::out | ios::binary);
 
-        if (!file.is_open()) {
-            // File doesn't exist, create new
+        if (!file.is_open() || file.peek() == EOF) {
+            file.close();
             file.open(filename, ios::out | ios::binary);
             file.close();
             file.open(filename, ios::in | ios::out | ios::binary);
@@ -213,18 +249,10 @@ public:
             Node root;
             write_node(root_pos, root);
         } else {
-            // File exists, read metadata
             file.seekg(0, ios::end);
             long size = file.tellg();
-            if (size == 0) {
-                root_pos = 0;
-                node_count = 1;
-                Node root;
-                write_node(root_pos, root);
-            } else {
-                root_pos = 0;
-                node_count = size / sizeof(Node);
-            }
+            root_pos = 0;
+            node_count = size / sizeof(Node);
         }
     }
 
@@ -235,31 +263,46 @@ public:
     }
 
     void insert(const char* index, int value) {
-        Key key(index, value);
-        Node root = read_node(root_pos);
-
-        if (root.key_count == M) {
-            Node new_root;
-            new_root.is_leaf = false;
-            new_root.key_count = 0;
-            new_root.children[0] = root_pos;
-
-            int new_root_pos = allocate_node();
-            root_pos = new_root_pos;
-
-            split_child(new_root, 0, root);
-            write_node(0, root);
-            write_node(new_root_pos, new_root);
-
-            insert_non_full(new_root_pos, key);
-        } else {
-            insert_non_full(root_pos, key);
-        }
+        Entry entry(index, value);
+        vector<int> path;
+        insert_helper(root_pos, entry, path);
     }
 
     void remove(const char* index, int value) {
-        Key key(index, value);
-        delete_key(root_pos, key);
+        Entry target(index, value);
+
+        // Find the leftmost leaf that might contain the target
+        int node_pos = root_pos;
+        Node node = read_node(node_pos);
+
+        while (!node.is_leaf) {
+            int i = 0;
+            while (i < node.n && target.index[0] != '\0' && node.keys[i] < target) {
+                i++;
+            }
+            node_pos = node.children[i];
+            node = read_node(node_pos);
+        }
+
+        // Search through leaf nodes
+        while (node_pos != -1) {
+            node = read_node(node_pos);
+            for (int i = 0; i < node.n; i++) {
+                if (node.keys[i] == target) {
+                    // Found the entry, remove it
+                    for (int j = i; j < node.n - 1; j++) {
+                        node.keys[j] = node.keys[j + 1];
+                    }
+                    node.n--;
+                    write_node(node_pos, node);
+                    return;
+                } else if (strcmp(node.keys[i].index, target.index) > 0) {
+                    // Past the key, not found
+                    return;
+                }
+            }
+            node_pos = node.next;
+        }
     }
 
     vector<int> find(const char* index) {
@@ -269,13 +312,15 @@ public:
         int node_pos = root_pos;
         Node node = read_node(node_pos);
 
+        Entry search_entry;
+        strncpy(search_entry.index, index, MAX_KEY_SIZE);
+        search_entry.index[MAX_KEY_SIZE] = '\0';
+        search_entry.value = -2147483648; // minimum int
+
         while (!node.is_leaf) {
             int i = 0;
-            while (i < node.key_count && strcmp(node.keys[i].index, index) <= 0) {
+            while (i < node.n && node.keys[i] < search_entry) {
                 i++;
-            }
-            if (i > 0 && strcmp(node.keys[i - 1].index, index) == 0) {
-                i--;
             }
             node_pos = node.children[i];
             node = read_node(node_pos);
@@ -284,8 +329,8 @@ public:
         // Traverse leaf nodes
         while (node_pos != -1) {
             node = read_node(node_pos);
-            for (int i = 0; i < node.key_count; i++) {
-                if (strcmp(node.keys[i].index, index) == 0) {
+            for (int i = 0; i < node.n; i++) {
+                if (node.keys[i].keyEquals(index)) {
                     result.push_back(node.keys[i].value);
                 } else if (strcmp(node.keys[i].index, index) > 0) {
                     sort(result.begin(), result.end());
