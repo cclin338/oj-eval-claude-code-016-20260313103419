@@ -3,11 +3,12 @@
 #include <cstring>
 #include <vector>
 #include <algorithm>
+#include <cstdio>
 
 using namespace std;
 
 const int MAX_KEY_SIZE = 64;
-const int ORDER = 85; // B+ tree order - optimized for block size
+const int ORDER = 100; // B+ tree order
 
 struct Entry {
     char index[MAX_KEY_SIZE + 1];
@@ -34,18 +35,14 @@ struct Entry {
     bool operator==(const Entry& other) const {
         return strcmp(index, other.index) == 0 && value == other.value;
     }
-
-    bool keyEquals(const char* idx) const {
-        return strcmp(index, idx) == 0;
-    }
 };
 
 struct Node {
     bool is_leaf;
-    int n; // number of keys
+    int n;
     Entry keys[ORDER];
-    int children[ORDER + 1]; // positions in file
-    int next; // for leaf nodes
+    int children[ORDER + 1];
+    int next;
 
     Node() {
         is_leaf = true;
@@ -59,34 +56,26 @@ struct Node {
 
 class BPlusTree {
 private:
-    fstream file;
+    FILE* file;
     string filename;
     int root_pos;
     int node_count;
 
-    int allocate_node() {
-        return node_count++;
-    }
-
     void write_node(int pos, const Node& node) {
-        file.seekp(pos * sizeof(Node));
-        file.write((char*)&node, sizeof(Node));
-        file.flush();
+        fseek(file, pos * sizeof(Node), SEEK_SET);
+        fwrite(&node, sizeof(Node), 1, file);
+        fflush(file);
     }
 
     Node read_node(int pos) {
         Node node;
-        file.seekg(pos * sizeof(Node));
-        file.read((char*)&node, sizeof(Node));
+        fseek(file, pos * sizeof(Node), SEEK_SET);
+        fread(&node, sizeof(Node), 1, file);
         return node;
     }
 
-    int find_child_index(const Node& node, const Entry& entry) {
-        int i = 0;
-        while (i < node.n && entry.index[0] != '\0' && node.keys[i] < entry) {
-            i++;
-        }
-        return i;
+    int allocate_node() {
+        return node_count++;
     }
 
     void insert_in_leaf(Node& leaf, const Entry& entry) {
@@ -99,197 +88,179 @@ private:
         leaf.n++;
     }
 
-    void insert_in_parent(int left_pos, const Entry& key, int right_pos, vector<int>& path) {
-        if (path.empty()) {
-            // Create new root
-            Node new_root;
-            new_root.is_leaf = false;
-            new_root.n = 1;
-            new_root.keys[0] = key;
-            new_root.children[0] = left_pos;
-            new_root.children[1] = right_pos;
-
-            int new_root_pos = allocate_node();
-            root_pos = new_root_pos;
-            write_node(new_root_pos, new_root);
-            return;
-        }
-
-        int parent_pos = path.back();
-        path.pop_back();
+    void split_child(int parent_pos, int child_idx) {
         Node parent = read_node(parent_pos);
+        int child_pos = parent.children[child_idx];
+        Node child = read_node(child_pos);
 
-        if (parent.n < ORDER) {
-            // Insert in parent
-            int i = parent.n - 1;
-            while (i >= 0 && key < parent.keys[i]) {
-                parent.keys[i + 1] = parent.keys[i];
-                parent.children[i + 2] = parent.children[i + 1];
-                i--;
+        Node new_node;
+        new_node.is_leaf = child.is_leaf;
+
+        int mid = (ORDER + 1) / 2;
+
+        if (child.is_leaf) {
+            // Split leaf node
+            new_node.n = child.n - mid;
+            for (int i = 0; i < new_node.n; i++) {
+                new_node.keys[i] = child.keys[mid + i];
             }
-            parent.keys[i + 1] = key;
-            parent.children[i + 2] = right_pos;
+            child.n = mid;
+
+            new_node.next = child.next;
+            int new_pos = allocate_node();
+            child.next = new_pos;
+
+            // Insert into parent
+            for (int i = parent.n; i > child_idx + 1; i--) {
+                parent.children[i + 1] = parent.children[i];
+            }
+            for (int i = parent.n - 1; i >= child_idx; i--) {
+                parent.keys[i + 1] = parent.keys[i];
+            }
+
+            parent.keys[child_idx] = new_node.keys[0];
+            parent.children[child_idx + 1] = new_pos;
             parent.n++;
+
+            write_node(child_pos, child);
+            write_node(new_pos, new_node);
             write_node(parent_pos, parent);
         } else {
-            // Split parent
-            Node new_parent;
-            new_parent.is_leaf = false;
-
-            int mid = ORDER / 2;
-            Entry entries[ORDER + 1];
-            int child_ptrs[ORDER + 2];
-
-            // Copy existing entries
-            for (int i = 0; i < parent.n; i++) {
-                entries[i] = parent.keys[i];
-                child_ptrs[i] = parent.children[i];
+            // Split internal node
+            new_node.n = child.n - mid;
+            for (int i = 0; i < new_node.n; i++) {
+                new_node.keys[i] = child.keys[mid + i];
+                new_node.children[i] = child.children[mid + i];
             }
-            child_ptrs[parent.n] = parent.children[parent.n];
+            new_node.children[new_node.n] = child.children[child.n];
 
-            // Insert new entry
-            int i = parent.n;
-            while (i > 0 && key < entries[i - 1]) {
-                entries[i] = entries[i - 1];
-                child_ptrs[i + 1] = child_ptrs[i];
-                i--;
+            Entry push_up_key = child.keys[mid - 1];
+            child.n = mid - 1;
+
+            int new_pos = allocate_node();
+
+            // Insert into parent
+            for (int i = parent.n; i > child_idx + 1; i--) {
+                parent.children[i + 1] = parent.children[i];
             }
-            entries[i] = key;
-            child_ptrs[i + 1] = right_pos;
-
-            // Split
-            parent.n = mid;
-            for (int i = 0; i < mid; i++) {
-                parent.keys[i] = entries[i];
-                parent.children[i] = child_ptrs[i];
+            for (int i = parent.n - 1; i >= child_idx; i--) {
+                parent.keys[i + 1] = parent.keys[i];
             }
-            parent.children[mid] = child_ptrs[mid];
 
-            Entry split_key = entries[mid];
+            parent.keys[child_idx] = push_up_key;
+            parent.children[child_idx + 1] = new_pos;
+            parent.n++;
 
-            new_parent.n = ORDER - mid;
-            for (int i = 0; i < new_parent.n; i++) {
-                new_parent.keys[i] = entries[mid + 1 + i];
-                new_parent.children[i] = child_ptrs[mid + 1 + i];
-            }
-            new_parent.children[new_parent.n] = child_ptrs[ORDER + 1];
-
-            int new_parent_pos = allocate_node();
+            write_node(child_pos, child);
+            write_node(new_pos, new_node);
             write_node(parent_pos, parent);
-            write_node(new_parent_pos, new_parent);
-
-            insert_in_parent(parent_pos, split_key, new_parent_pos, path);
         }
     }
 
-    void insert_helper(int node_pos, const Entry& entry, vector<int>& path) {
+    void insert_non_full(int node_pos, const Entry& entry) {
         Node node = read_node(node_pos);
 
         if (node.is_leaf) {
-            if (node.n < ORDER) {
-                insert_in_leaf(node, entry);
-                write_node(node_pos, node);
-            } else {
-                // Split leaf
-                Node new_leaf;
-                new_leaf.is_leaf = true;
-                new_leaf.next = node.next;
-
-                Entry entries[ORDER + 1];
-                for (int i = 0; i < node.n; i++) {
-                    entries[i] = node.keys[i];
-                }
-
-                // Insert new entry
-                int i = node.n;
-                while (i > 0 && entry < entries[i - 1]) {
-                    entries[i] = entries[i - 1];
-                    i--;
-                }
-                entries[i] = entry;
-
-                // Split
-                int mid = (ORDER + 1) / 2;
-                node.n = mid;
-                for (int i = 0; i < mid; i++) {
-                    node.keys[i] = entries[i];
-                }
-
-                new_leaf.n = ORDER + 1 - mid;
-                for (int i = 0; i < new_leaf.n; i++) {
-                    new_leaf.keys[i] = entries[mid + i];
-                }
-
-                int new_leaf_pos = allocate_node();
-                node.next = new_leaf_pos;
-                write_node(node_pos, node);
-                write_node(new_leaf_pos, new_leaf);
-
-                insert_in_parent(node_pos, new_leaf.keys[0], new_leaf_pos, path);
-            }
+            insert_in_leaf(node, entry);
+            write_node(node_pos, node);
         } else {
-            int idx = find_child_index(node, entry);
-            path.push_back(node_pos);
-            insert_helper(node.children[idx], entry, path);
+            int i = 0;
+            while (i < node.n && node.keys[i] < entry) {
+                i++;
+            }
+
+            int child_pos = node.children[i];
+            Node child = read_node(child_pos);
+
+            if (child.n >= ORDER) {
+                split_child(node_pos, i);
+                node = read_node(node_pos);
+                if (node.keys[i] < entry || node.keys[i] == entry) {
+                    i++;
+                }
+            }
+
+            insert_non_full(node.children[i], entry);
         }
     }
 
 public:
     BPlusTree(const string& fname) : filename(fname) {
-        file.open(filename, ios::in | ios::out | ios::binary);
+        file = fopen(filename.c_str(), "rb+");
 
-        if (!file.is_open() || file.peek() == EOF) {
-            file.close();
-            file.open(filename, ios::out | ios::binary);
-            file.close();
-            file.open(filename, ios::in | ios::out | ios::binary);
-
+        if (!file) {
+            // Create new file
+            file = fopen(filename.c_str(), "wb+");
             root_pos = 0;
             node_count = 1;
             Node root;
             write_node(root_pos, root);
         } else {
-            file.seekg(0, ios::end);
-            long size = file.tellg();
-            root_pos = 0;
-            node_count = size / sizeof(Node);
+            // File exists
+            fseek(file, 0, SEEK_END);
+            long size = ftell(file);
+            if (size == 0) {
+                root_pos = 0;
+                node_count = 1;
+                Node root;
+                write_node(root_pos, root);
+            } else {
+                root_pos = 0;
+                node_count = size / sizeof(Node);
+            }
         }
     }
 
     ~BPlusTree() {
-        if (file.is_open()) {
-            file.close();
+        if (file) {
+            fclose(file);
         }
     }
 
     void insert(const char* index, int value) {
         Entry entry(index, value);
-        vector<int> path;
-        insert_helper(root_pos, entry, path);
+        Node root = read_node(root_pos);
+
+        if (root.n >= ORDER) {
+            // Create new root
+            Node new_root;
+            new_root.is_leaf = false;
+            new_root.children[0] = root_pos;
+
+            int new_root_pos = allocate_node();
+            int old_root_pos = root_pos;
+            root_pos = new_root_pos;
+
+            write_node(old_root_pos, root);
+            write_node(new_root_pos, new_root);
+
+            split_child(new_root_pos, 0);
+        }
+
+        insert_non_full(root_pos, entry);
     }
 
     void remove(const char* index, int value) {
         Entry target(index, value);
 
-        // Find the leftmost leaf that might contain the target
+        // Find leaf node
         int node_pos = root_pos;
         Node node = read_node(node_pos);
 
         while (!node.is_leaf) {
             int i = 0;
-            while (i < node.n && target.index[0] != '\0' && node.keys[i] < target) {
+            while (i < node.n && node.keys[i] < target) {
                 i++;
             }
             node_pos = node.children[i];
             node = read_node(node_pos);
         }
 
-        // Search through leaf nodes
+        // Search and delete from leaf
         while (node_pos != -1) {
             node = read_node(node_pos);
             for (int i = 0; i < node.n; i++) {
                 if (node.keys[i] == target) {
-                    // Found the entry, remove it
                     for (int j = i; j < node.n - 1; j++) {
                         node.keys[j] = node.keys[j + 1];
                     }
@@ -297,7 +268,6 @@ public:
                     write_node(node_pos, node);
                     return;
                 } else if (strcmp(node.keys[i].index, target.index) > 0) {
-                    // Past the key, not found
                     return;
                 }
             }
@@ -308,29 +278,29 @@ public:
     vector<int> find(const char* index) {
         vector<int> result;
 
-        // Find the leftmost leaf
+        // Find leftmost leaf
         int node_pos = root_pos;
         Node node = read_node(node_pos);
 
-        Entry search_entry;
-        strncpy(search_entry.index, index, MAX_KEY_SIZE);
-        search_entry.index[MAX_KEY_SIZE] = '\0';
-        search_entry.value = -2147483648; // minimum int
+        Entry search;
+        strncpy(search.index, index, MAX_KEY_SIZE);
+        search.index[MAX_KEY_SIZE] = '\0';
+        search.value = -2147483648;
 
         while (!node.is_leaf) {
             int i = 0;
-            while (i < node.n && node.keys[i] < search_entry) {
+            while (i < node.n && node.keys[i] < search) {
                 i++;
             }
             node_pos = node.children[i];
             node = read_node(node_pos);
         }
 
-        // Traverse leaf nodes
+        // Traverse leaves
         while (node_pos != -1) {
             node = read_node(node_pos);
             for (int i = 0; i < node.n; i++) {
-                if (node.keys[i].keyEquals(index)) {
+                if (strcmp(node.keys[i].index, index) == 0) {
                     result.push_back(node.keys[i].value);
                 } else if (strcmp(node.keys[i].index, index) > 0) {
                     sort(result.begin(), result.end());
